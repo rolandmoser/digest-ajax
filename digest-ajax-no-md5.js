@@ -119,6 +119,7 @@
             type: 'GET'
         }, s);
 
+
         var dfd = $.Deferred();
         return dfd.promise(doAjaxUnauthorized());
 
@@ -132,7 +133,14 @@
                 .fail(function(jqXHR, textStatus, errorThrown) {
                     //Only attempt Digest authentication on a 401/407 response
                     if (jqXHR.status === 401 || jqXHR.status === 407) {
-                        doAjaxAuthorized(createAuthorizationHeader(jqXHR));
+                        var auth = createAuthorizationHeader(jqXHR)
+                        if(auth !== null) {
+                            doAjaxAuthorized(auth);
+                        }
+                        else {
+                            // no matching authentication found.
+                            dfd.reject(jqXHR, textStatus, errorThrown);
+                        }
                     }
                     else {
                         dfd.reject(jqXHR, textStatus, errorThrown);
@@ -166,15 +174,63 @@
                 });
         }
 
+        function getAllMyResponseHeaders(xhr) {
+            var headersDict = {}
+            var headersString = xhr.getAllResponseHeaders();
+            var headers = headersString.split('\u000d\u000a');
+            for (var i=0;i<headers.length;i++) {
+                var items = headers[i].split(": ", 2);
+                var key = items[0];
+                if (key == "") continue;
+
+                var value = "";
+                if (items.length == 2)
+                    value = items[1];
+
+                headersDict[key.toLowerCase()] = value.split('\u000a');
+            }
+            return headersDict;
+        }
+
+        function getMyResponseHeader(xhr, key) {
+            headersDict = getAllMyResponseHeaders(xhr);
+            return headersDict[key.toLowerCase()];
+        }
+
         function createAuthorizationHeader(xhr) {
-            var header = xhr.getResponseHeader(DigestAjax.WWW_AUTHENTICATE);
-            if (header !== undefined && header !== null) {
-                var params = parseWWWAuthenticateHeader(header);
+            var headers = getMyResponseHeader(xhr, DigestAjax.WWW_AUTHENTICATE);
+
+            if (headers === undefined) {
+                // no authentication requested
+                return null;
+            }
+
+            // pick the first supported authentication
+            var params;
+            for (var i=0;i<headers.length;i++) {
+                params = parseWWWAuthenticateHeader(headers[i]);
 
                 var qop = params.qop;
-                var clientQop = 'auth';
+                if (qop !== undefined && qop !== 'auth' && qop !== 'auth-int') continue;
+
+                var algorithm = params.algorithm;
+                if (algorithm !== undefined && algorithm !== 'MD5' && algorithm !== 'MD5-sess') continue;
+
+                break;
+            }
+
+            if (i === headers.length) {
+                // no authentication matched
+                return null;
+            }
+            else {
+                var qop = params.qop;
+                var clientQop = undefined;
                 if (qop !== undefined && qop.toLowerCase() === 'auth-int') {
                     clientQop = 'auth-int';
+                }
+                else if (qop !== undefined && qop.toLowerCase() === 'auth') {
+                    clientQop = 'auth';
                 }
 
                 //HA1 Calculation
@@ -194,18 +250,16 @@
                         }, DigestAjax.authHelper());
                         $.extend(s, auth);
                     }
-                    if (algorithm !== undefined && algorithm.toLowerCase() === 'md5-sess') {
-                        cnonce = generateCnonce();
-                        ha1 = CryptoJS.MD5(CryptoJS.MD5(s.username + ':' 
-                                + params.realm + ':' + s.password) + ':' 
-                                + params.nonce + ':' + cnonce);
-                    }
-                    else {
-                        ha1 = CryptoJS.MD5(s.username + ':' + params.realm + ':' + s.password);
-                    }
+                    ha1 = CryptoJS.MD5(s.username + ':' + params.realm + ':' + s.password);
                     username = s.username;
                     DigestAjax.UNAUTH_HA1 = ha1;
                     DigestAjax.UNAUTH_USERNAME = s.username;
+                }
+
+                if (algorithm !== undefined && algorithm.toLowerCase() === 'md5-sess') {
+                    cnonce = generateCnonce();
+                    ha1 = CryptoJS.MD5(ha1 + ':' 
+                            + params.nonce + ':' + cnonce);
                 }
 
                 //HA2 Calculation
@@ -220,7 +274,7 @@
 
                 //Response Calculation
                 var response, nc;
-                if (params.qop === undefined) {
+                if (clientQop === undefined) {
                     response = CryptoJS.MD5(ha1 + ':' + params.nonce + ':' + ha2);
                 }
                 else {
@@ -229,6 +283,7 @@
                         //Cnonce may have been generated already for MD5-sess algorithm
                         cnonce = generateCnonce();
                     }
+                    //TODO fix nc calculation
                     nc = '00000001';
                     response = CryptoJS.MD5(ha1 + ':' + params.nonce + ':' 
                             + nc + ':' + cnonce + ':' + clientQop + ':' + ha2);
@@ -239,7 +294,12 @@
                 sb.push('realm="', params.realm, '",');
                 sb.push('nonce="', params.nonce, '",');
                 sb.push('uri="', s.requestUri, '",');
-                sb.push('qop=', clientQop, ',');
+                if (clientQop !== undefined) {
+                    sb.push('qop=', clientQop, ',');
+                }
+                if (algorithm !== undefined) {
+                    sb.push('algorithm="', algorithm, '",');
+                }
                 if (nc !== undefined) {
                     sb.push('nc=', nc, ',');
                 }
